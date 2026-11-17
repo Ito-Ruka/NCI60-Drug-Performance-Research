@@ -1,2 +1,0 @@
-NCI-60 Growth Inhibition Data: https://wiki.nci.nih.gov/spaces/NCIDTPdata/pages/147193864/NCI-60+Growth+Inhibition+Data
-Chemical Data: https://wiki.nci.nih.gov/spaces/NCIDTPdata/pages/155844992/Chemical+Data
