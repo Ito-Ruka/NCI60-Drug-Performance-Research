@@ -1,0 +1,618 @@
+import pandas as pd
+import numpy as np
+from rdkit import Chem
+from rdkit.Chem.SaltRemover import SaltRemover
+from rdkit.Chem import Descriptors
+import matplotlib.pyplot as plt
+import seaborn as sns
+import os
+from rdkit.Chem import Draw
+from efgs import get_dec_fgs
+import pickle
+
+
+
+def import_input_main_data():
+    df_DOSERESP = pd.read_csv(r"C:\NCI-60 Research\Input_Data\DOSERESP.csv")
+    df_NCI60_SMILES = pd.read_csv(r"C:\NCI-60 Research\Input_Data\nsc_smiles.csv")
+    df_doubling = pd.read_csv(r"C:\NCI-60 Research\Input_Data\NCI-60_Cell_Line_Doubling_Times.csv")
+    return df_DOSERESP, df_NCI60_SMILES, df_doubling
+
+
+
+def remove_non_M_units(df_DOSERESP):
+    unit = "M"
+    df_DOSERESP = df_DOSERESP[df_DOSERESP["CONCENTRATION_UNIT"] == unit].copy()
+    return df_DOSERESP
+
+
+
+def convert_to_viability(df_DOSERESP, df_doubling):
+    df_doubling = df_doubling.set_index("CELL_NAME")
+    doubling_time = df_doubling["Doubling Time (hours)"]
+    td = df_DOSERESP["CELL_NAME"].map(doubling_time)
+    pg = df_DOSERESP["AVERAGE_GIPRCNT"]
+    
+    G = 2**(48/td)
+
+    viability_values = []
+    
+    for p, growth_factor in zip(pg, G):
+        if pd.isna(p) or pd.isna(growth_factor):
+            viability_values.append(np.nan)
+        
+        elif p >= 0:
+            val = (((p / 100.0) * (growth_factor - 1.0)) + 1.0) / growth_factor
+            viability_values.append(val)
+        
+        else:
+            val = ((p / 100.0) + 1.0) / growth_factor
+            viability_values.append(val)
+    
+    df_DOSERESP["VIABILITY"] = viability_values
+
+    return df_DOSERESP
+
+
+
+def aggregate_experimental_duplicates(df_DOSERESP):
+    group = ["NSC", "CONCENTRATION", "CELL_NAME"]
+    duplicates = df_DOSERESP.duplicated(subset = group, keep = False)
+    
+    df_duplicates = df_DOSERESP[duplicates]
+    df_uniques = df_DOSERESP[~duplicates]
+
+    df_aggregated = df_duplicates.groupby(group, as_index = False)["VIABILITY"].median()
+    df_uniques = df_uniques[group + ["VIABILITY"]]
+    
+    df_DOSERESP = (pd.concat([df_uniques, df_aggregated], ignore_index = True))
+
+    return df_DOSERESP, df_duplicates, df_uniques
+
+
+
+def cell_line_isolation(df_DOSERESP):
+
+    def available_cell_lines(df_DOSERESP):
+        cell_line_options = (df_DOSERESP["CELL_NAME"].value_counts().reset_index())
+        cell_line_options.columns = ["CELL_NAME", "COUNT"]
+        return cell_line_options
+
+
+    def select_cell_line(df_DOSERESP, cell_line_input):
+        df_DOSERESP = df_DOSERESP[df_DOSERESP["CELL_NAME"] == cell_line_input].reset_index(drop = True)
+        return df_DOSERESP
+
+
+    cell_line_options = available_cell_lines(df_DOSERESP)
+    with pd.option_context("display.max_rows", None):
+        print(cell_line_options.to_string(index = False))
+
+
+    cell_line_input = input("\nEnter target cell line: ")
+    print(f"Isolating {cell_line_input} cell line response data.")    
+    df_DOSERESP = select_cell_line(df_DOSERESP, cell_line_input)  
+    
+    print(f"\nData size after isolating {cell_line_input} cell line: {df_DOSERESP.shape}")
+        
+    return df_DOSERESP
+
+
+
+def conc_range_isolation(df_DOSERESP):
+   
+    def analyze_conc_distribution(df_DOSERESP):
+        conc_distribution = df_DOSERESP["CONCENTRATION"].value_counts()
+        return conc_distribution
+
+
+    def drop_invalid_conc(df_DOSERESP, selected_conc_list):
+        required_concs = list(selected_conc_list)
+        expected_count = len(required_concs)
+
+        df_filtered = df_DOSERESP[df_DOSERESP["CONCENTRATION"].isin(required_concs)].copy()
+        points_per_curve = df_filtered.groupby(["NSC", "CELL_NAME"])["CONCENTRATION"].transform("nunique")
+        df_DOSERESP = df_filtered[points_per_curve == expected_count].copy()
+        return df_DOSERESP
+
+
+
+    df_conc_distribution = analyze_conc_distribution(df_DOSERESP)
+    print(df_conc_distribution)
+    print("\nNCI-60 standard 5 concentration values (log molar): -4.0000, -5.0000, -6.0000, -7.000, -8.0000")
+    
+    conc_use_question = input(
+        "[1]: Standard 5 Concentration Values, [2]: Custom Concentration Value Set"
+        "\nEnter (1/2): "
+        ).strip()
+
+    if (conc_use_question == "1"):
+        selected_conc_list = sorted([-4.0000, -5.0000, -6.0000, -7.000, -8.0000])
+        print(f"\nExtracting the follwoing concentration(s): {selected_conc_list}")
+        df_DOSERESP = drop_invalid_conc(df_DOSERESP, selected_conc_list)
+
+    elif (conc_use_question == "2"):
+        selected_conc_list = [float(x.strip()) for x in input("Enter standardized concentrations (separated by comma): ").strip().split(",")]
+        selected_conc_list = sorted(selected_conc_list)
+        print(f"\nExtracting the follwoing concentration(s): {selected_conc_list}")
+        df_DOSERESP = drop_invalid_conc(df_DOSERESP, selected_conc_list)
+
+    return df_DOSERESP
+
+
+
+def invalid_SMILES_filter(df_NCI60_SMILES):
+    invalid_smiles = []
+
+    for index, smiles in df_NCI60_SMILES["SMILES"].items():
+        if not isinstance(smiles, str) or Chem.MolFromSmiles(smiles) is None:
+            invalid_smiles.append(index)
+            print(f"Complelted verification for: {smiles}\n")
+        
+    df_NCI60_SMILES.drop(index = invalid_smiles, inplace = True)
+    df_NCI60_SMILES.reset_index(drop = True, inplace = True)
+    return df_NCI60_SMILES, invalid_smiles
+
+
+
+def remove_salt(df_NCI60_SMILES):
+    remover = SaltRemover()
+
+    for idx, row in df_NCI60_SMILES.iterrows():
+        smiles = row["SMILES"]
+        mol = Chem.MolFromSmiles(smiles)
+
+        if mol is not None:
+            stripped = remover.StripMol(mol, dontRemoveEverything = True)
+            df_NCI60_SMILES.at[idx, "SMILES"] = Chem.MolToSmiles(stripped)
+    
+    return df_NCI60_SMILES
+
+
+
+def canonicalize_smiles_string(df_NCI60_SMILES, isomericSmiles):
+    smiles_list = df_NCI60_SMILES["SMILES"].astype(str).tolist()
+    canonicalized_smiles_list = []
+    
+    for smiles in smiles_list:
+        mol = Chem.MolFromSmiles(smiles)
+        if mol is None:
+            return None
+        else:
+            canonicalized_smiles_list.append(Chem.MolToSmiles(mol, isomericSmiles = isomericSmiles))
+        print(f"Canonicalized: {smiles}")
+        
+    df_NCI60_SMILES["SMILES"] = canonicalized_smiles_list
+    return df_NCI60_SMILES
+
+
+
+def mol_weight_filter(df_NCI60_SMILES, df_DOSERESP):
+    
+    def get_mol_weight(df_NCI60_SMILES):
+        nsc_list = df_NCI60_SMILES["NSC"].tolist()
+        smiles_list = df_NCI60_SMILES["SMILES"].astype(str).tolist()
+        mol_weight_list = []
+        
+        for smiles in smiles_list:
+            mol = Chem.MolFromSmiles(smiles) 
+            if mol is None:
+                mol_weight_list.append(None)
+            else:
+                mol_weight_list.append(Descriptors.MolWt(mol))
+                print(f"Completed calculating molecular weight for: {smiles}.")
+
+        df_NCI60_SMILES_MOL_WEIGHT = pd.DataFrame()
+        df_NCI60_SMILES_MOL_WEIGHT["NSC"] = nsc_list
+        df_NCI60_SMILES_MOL_WEIGHT["NSC"] = df_NCI60_SMILES_MOL_WEIGHT["NSC"].astype("int64")
+        df_NCI60_SMILES_MOL_WEIGHT["MOL_WEIGHT"] = mol_weight_list
+        df_NCI60_SMILES_MOL_WEIGHT = df_NCI60_SMILES_MOL_WEIGHT.dropna(subset=["MOL_WEIGHT"]).reset_index(drop=True)
+        return df_NCI60_SMILES_MOL_WEIGHT
+
+
+    def plot_mol_weight(df_DOSERESP, df_NCI60_SMILES_MOL_WEIGHT):
+        q25 = df_NCI60_SMILES_MOL_WEIGHT["MOL_WEIGHT"].quantile(0.25)
+        q75 = df_NCI60_SMILES_MOL_WEIGHT["MOL_WEIGHT"].quantile(0.75)
+        iqr = q75 - q25
+        lower_bound = q25 - (1.5 * iqr)
+        upper_bound = q75 + (1.5 * iqr)
+
+        df_plot_data = pd.merge(df_DOSERESP, df_NCI60_SMILES_MOL_WEIGHT[["NSC", "MOL_WEIGHT"]], on="NSC", how="inner")
+        df_plot_data["IS_OUTLIER"] = (df_plot_data["MOL_WEIGHT"] < lower_bound) | (df_plot_data["MOL_WEIGHT"] > upper_bound)
+
+        plt.figure(figsize=(15, 10))
+        sns.scatterplot(
+            data=df_plot_data,
+            x="MOL_WEIGHT",
+            y="VIABILITY",
+            hue="IS_OUTLIER",
+            palette={False: "blue", True: "red"},
+            alpha=0.6,
+            s=30
+        )
+
+        plt.title("Molecular Weight vs. Viability (Showing Data Point IQR)")
+        plt.xlabel("Molecular Weight (g/mol)")
+        plt.ylabel("Viability")
+        plt.tight_layout()
+        plt.show()
+
+
+    def mol_weight_filter (df_NCI60_SMILES_MOL_WEIGHT):
+        #TODO: Potential bug: if you enter "n", then crash.
+        mol_weight_filter_choice = input(
+            "\nProceed to filter SMILES srings with respect to molecular weight?" 
+            "\nEnter (y/n): "
+        )
+        
+        if mol_weight_filter_choice == "y":
+            method = input(
+                "\nSelect method of filtration: [1] IQR Filter or [2] Cutoff Range" 
+                "\nEnter (1/2): "
+            ).strip()
+
+            if method == "1":
+                print("\nProceeding with IQR.")
+                q25 = df_NCI60_SMILES_MOL_WEIGHT["MOL_WEIGHT"].quantile(0.25)
+                q75 = df_NCI60_SMILES_MOL_WEIGHT["MOL_WEIGHT"].quantile(0.75)
+                iqr = q75 - q25
+
+                lower_bound = q25 - (1.5 * iqr)
+                upper_bound = q75 + (1.5 * iqr)
+
+            elif method == "2":
+                print("\nProceeding with range selection.")
+                print("Recomended deafult settings: (0, 1000)")
+                lower_bound = float(input("Enter minimum molecular weight (g/mol): ").strip())
+                upper_bound = float(input("Enter maximum molecular weight (g/mol): ").strip())
+        
+            bound_filtering_result = (df_NCI60_SMILES_MOL_WEIGHT["MOL_WEIGHT"] >= lower_bound) & (df_NCI60_SMILES_MOL_WEIGHT["MOL_WEIGHT"] <= upper_bound)
+            print(f"\nCutoff bounds: [{lower_bound:.2f}, {upper_bound:.2f}] g/mol")
+
+            df_mol_weight_outliers = df_NCI60_SMILES_MOL_WEIGHT[~bound_filtering_result].reset_index(drop=True)
+            df_NCI60_SMILES_MOL_WEIGHT = df_NCI60_SMILES_MOL_WEIGHT[bound_filtering_result].reset_index(drop=True)
+            print(
+                f"\nRetained {len(df_NCI60_SMILES_MOL_WEIGHT)} compounds." 
+                f"\nDropped {len(df_mol_weight_outliers)} outliers."
+            )
+        
+        else:
+            print("\nProceeding forward.")
+
+        return df_NCI60_SMILES_MOL_WEIGHT, df_mol_weight_outliers
+
+    df_NCI60_SMILES_MOL_WEIGHT = get_mol_weight(df_NCI60_SMILES)
+    plot_mol_weight(df_DOSERESP, df_NCI60_SMILES_MOL_WEIGHT)
+    df_NCI60_SMILES_MOL_WEIGHT, df_mol_weight_outliers = mol_weight_filter(df_NCI60_SMILES_MOL_WEIGHT)
+    return df_NCI60_SMILES_MOL_WEIGHT
+
+
+
+def merge_data_frames(df_DOSERESP, df_NCI60_SMILES, df_NCI60_SMILES_MOL_WEIGHT):
+    df_MAIN_DATA = pd.DataFrame()
+    df_MAIN_DATA = pd.merge(df_DOSERESP, df_NCI60_SMILES, on = "NSC", how = "inner")
+    df_MAIN_DATA = df_MAIN_DATA.dropna().reset_index(drop=True)
+
+    df_MAIN_DATA = pd.merge(df_MAIN_DATA, df_NCI60_SMILES_MOL_WEIGHT[["NSC", "MOL_WEIGHT"]], on="NSC", how="inner")
+    df_MAIN_DATA = df_MAIN_DATA.dropna().reset_index(drop=True)
+    df_MAIN_DATA = df_MAIN_DATA.drop(columns = "MOL_WEIGHT")
+
+    df_MAIN_DATA = df_MAIN_DATA.sort_values(by = ["NSC", "CONCENTRATION"]).reset_index(drop = True)
+
+    return df_MAIN_DATA
+
+
+
+def visual_check_render(df_MAIN_DATA):
+    df_MAIN_DATA["SMILES"] = df_MAIN_DATA["SMILES"].apply(lambda x: x[0] if isinstance(x, tuple) else str(x))
+
+    smiles_to_render = df_MAIN_DATA["SMILES"].unique().tolist()
+    nsc_to_render = df_MAIN_DATA["NSC"].unique().tolist()
+
+    output_dir = (r"C:\NCI-60 Research\Tokenization\Output_Files\Rendered_2D_png")
+    os.makedirs(output_dir, exist_ok = True)
+
+    for smile, nsc in zip(smiles_to_render, nsc_to_render):
+        mol = Chem.MolFromSmiles(smile)
+        if mol is None:
+            continue
+        
+        Chem.rdDepictor.Compute2DCoords(mol)
+
+        img = Draw.MolToImage(mol, size = (1000, 1000))
+
+        file_name = os.path.join(output_dir, f"NSC_{nsc}.png")
+        img.save(file_name)
+    return
+
+
+
+"""
+Algortim to indentify functional groups: https://link.springer.com/article/10.1186/s13321-017-0225-z
+RDkit Replication of Ertl's algorithm: https://github.com/rdkit/rdkit/tree/master/Contrib/IFG, https://link.springer.com/article/10.1186/s13321-019-0361-8
+    - Continued improvemnt to the algorithm: https://pubs.acs.org/jcisd8/article/65/3/1061/3686186/EFGs-A-Complete-and-Accurate-Implementation-of?searchresult=1
+
+Plan:
+    - For loop through the NCI60 smiles string list to parse and identify functional groups of the molecule
+        - Note: functional group structure needs to be structurally accurate and identical across another moleule containing the same functional gorup.
+    - Create a dictionary of total fucntional groups found in the NCI60 smiles string list.
+        - Good time to get the stats of the functional groups.
+            - drop any functional groups that shows up too few.
+    - Assign indexes to each functional group.
+    - Go back the the NCI60 SMILES list and apply the functional groups
+    - for each functional group, find the atom bonding sites.
+"""
+
+#TODO: Reroute import_previous_functional_group_outputs_choice == "y" so it does not need to pass through this function.
+def get_and_save_functional_group_data(df_MAIN_DATA, import_previous_functional_group_outputs_choice):
+
+    def find_functional_groups(df_MAIN_DATA):
+        # https://pubs.acs.org/jcisd8/article/65/3/1061/3686186/EFGs-A-Complete-and-Accurate-Implementation-of?searchresult=1
+        smiles_list = df_MAIN_DATA["SMILES"].dropna().astype(str).unique().tolist()
+        
+        fg_img_list = {}
+        fg_atom_list = {}
+        dec_fgs_list = {}
+        fg_mol_list = {}
+
+        for smiles in smiles_list:
+            mol = Chem.MolFromSmiles(smiles)
+
+            if mol is None:
+                fg_img_list[smiles] = None
+                fg_atom_list[smiles] = None
+                dec_fgs_list[smiles] = None
+                fg_mol_list[smiles] = None
+                continue
+
+            try:
+                fg_img, fg_atom, dec_fgs, fg_mol = get_dec_fgs(mol)
+            except Exception as e:
+                print(f"Skipping {smiles} due to EFG error: {e}.")
+                fg_img_list[smiles] = None
+                fg_atom_list[smiles] = None
+                dec_fgs_list[smiles] = None
+                fg_mol_list[smiles] = None
+                continue
+            
+            fg_img_list[smiles] = fg_img
+            fg_atom_list[smiles] = fg_atom
+            dec_fgs_list[smiles] = list(dec_fgs) if dec_fgs else []
+            fg_mol_list[smiles] = fg_mol
+            print(f"Proccessed: {smiles}")
+
+        return fg_img_list, fg_atom_list, dec_fgs_list, fg_mol_list
+
+
+    def save_functional_group_data(fg_img_list, fg_atom_list, dec_fgs_list, fg_mol_list):
+        df_dec_fgs = pd.DataFrame({
+            "smiles": list(dec_fgs_list.keys()),
+            "functional_groups": list(dec_fgs_list.values())
+        })
+        df_dec_fgs.to_csv(r"C:\NCI-60 Research\Tokenization\Output_Files\EFG_Output\df_dec_fgs.csv", index=False)
+        print("\nExported [df_dec_fgs.csv].")
+
+
+        df_fg_atom = pd.DataFrame({
+            "smiles": list(fg_atom_list.keys()),
+            "fg_atom": list(fg_atom_list.values())
+        })
+        df_fg_atom.to_csv(r"C:\NCI-60 Research\Tokenization\Output_Files\EFG_Output\df_fg_atom.csv", index=False)
+        print("\nExported [df_fg_atom.csv].")
+
+
+        with open(r"C:\NCI-60 Research\Tokenization\Output_Files\EFG_Output\fg_mol.pkl", "wb") as f:
+            pickle.dump(fg_mol_list, f)
+        print("\nExported [fg_mols.pkl].")
+
+        img_dir = r"C:\NCI-60 Research\Tokenization\Output_Files\EFG_Output\df_img"
+        os.makedirs(img_dir, exist_ok = True)
+        for idx, (smiles, img_bytes) in enumerate(fg_img_list.items()):
+            if img_bytes:
+                img_path = os.path.join(img_dir, f"mol_{idx}.png")
+                with open(img_path, "wb") as f:
+                    f.write(img_bytes)
+        return 
+
+
+    def remaining_frgaments (df_dec_fgs, df_fg_atom):
+        
+        print("worked")
+        return 
+
+
+    if import_previous_functional_group_outputs_choice == "n":
+        fg_img_list, fg_atom_list, dec_fgs_list, fg_mol_list = find_functional_groups(df_MAIN_DATA)
+        save_functional_group_data(fg_img_list, fg_atom_list, dec_fgs_list, fg_mol_list)
+    
+    elif import_previous_functional_group_outputs_choice == "y":
+        df_dec_fgs = pd.read_csv(r"C:\NCI-60 Research\Tokenization\Output_Files\EFG_Output\df_dec_fgs.csv")
+        df_fg_atom = pd.read_csv(r"C:\NCI-60 Research\Tokenization\Output_Files\EFG_Output\df_fg_atom.csv")
+
+    remaining_frgaments(df_dec_fgs, df_fg_atom)
+    
+    return 
+
+
+def import_previous_outputs():
+    import_previous_output_choice = input(
+        "\nDo you have [df_MAIN_DATA.csv] saved?"
+        "\nEnter (y/n): "
+    ).strip().lower()
+    
+    if import_previous_output_choice == "y":
+        print("Importing [df_MAIN_DATA.csv].")
+        df_MAIN_DATA = pd.read_csv(r"C:\NCI-60 Research\Tokenization\Output_Files\df_MAIN_DATA.csv")
+        print(f"\ndf_MAIN_DATA: {df_MAIN_DATA.shape}")
+        print(df_MAIN_DATA.head(10))
+        get_and_save_functional_group_data_execution_script (df_MAIN_DATA)
+
+    elif import_previous_output_choice == "n":
+        print("Proceeding fowrward.")
+        data_filtering_execution_script()
+    return
+
+
+
+def data_filtering_execution_script ():
+    print("\nImporting input data.")
+    df_DOSERESP, df_NCI60_SMILES, df_doubling = import_input_main_data()
+    print(
+        f"df_DOSERESP:        {df_DOSERESP.shape}\n"
+        f"df_NCI60_SMILES:    {df_NCI60_SMILES.shape}\n"
+        f"df_doubling:        {df_doubling.shape}"
+    ) 
+    print("\n", (df_DOSERESP.head(10)))
+
+
+    print(f"\nDropping data points with non M (log molar) concenctration units.")
+    df_DOSERESP = remove_non_M_units(df_DOSERESP)
+    print(f"Data size after unit filteration: {df_DOSERESP.shape}")
+
+
+    print("\nStanderdizing experimental outputs to viability values.")
+    df_DOSERESP = convert_to_viability(df_DOSERESP, df_doubling)
+    print(f"Data size after VIABILITY unit conversion: {df_DOSERESP.shape}")
+
+
+    print(
+        "\nAggregating experimental duplicates."
+        "\nAggregation method = med"
+        )
+    df_DOSERESP, df_duplicates, df_uniques = aggregate_experimental_duplicates(df_DOSERESP)
+    print(
+        f"Found {len(df_duplicates)} total experimental duplicates."
+        f"\nFound {len(df_uniques)} unique data points."
+        f"\nData size after aggregation: {df_DOSERESP.shape}"
+        )
+
+
+    cell_line_isolation_choice = input(
+        "\nExtract screening profiles for an individual cell line?" 
+        "\nEnter(y/n): "
+    ).strip().lower()
+    
+    if (cell_line_isolation_choice == "y"):
+        df_DOSERESP = cell_line_isolation(df_DOSERESP)
+    else:
+        print("Continuing foward.")
+
+
+    print("\nStanderdizing dosage for drug response curve.")
+    df_DOSERESP = conc_range_isolation(df_DOSERESP)
+
+
+    print("\nFiltering invalid SMILES strings.")
+    df_NCI60_SMILES, invalid_smiles =  invalid_SMILES_filter(df_NCI60_SMILES)
+    print(f"Found and dropped {len(invalid_smiles)} invalid SMILES strings.")
+
+
+    salt_remover_choice = input(
+        "\nRemove salts from SMILES strings?"
+        "\nEnter (y/n): "
+    ).strip().lower()
+    if (salt_remover_choice == "y"):
+        print("Removing salts from SMILES strings.")
+        df_NCI60_SMILES = remove_salt(df_NCI60_SMILES)
+    else: 
+        print("Continuing foward.")
+
+
+    print("\nCanonicalizing SMILES string.")
+    isomeric_choice = input(
+        "\nKeep SMILES isomeric?"
+        "\nEnter (y/n): "
+    )
+    if isomeric_choice == "y":
+        isomericSmiles = True
+    elif isomeric_choice == "n":
+        isomericSmiles = False 
+    df_NCI60_SMILES = canonicalize_smiles_string(df_NCI60_SMILES, isomericSmiles)
+
+    
+    print("\nCalculating molecular weight.")
+    df_NCI60_SMILES_MOL_WEIGHT = mol_weight_filter(df_NCI60_SMILES, df_DOSERESP)
+
+
+    print("\nMerging data frames.")
+    df_MAIN_DATA = merge_data_frames (df_DOSERESP, df_NCI60_SMILES, df_NCI60_SMILES_MOL_WEIGHT)
+    preview_choice = input(
+        "Preview filtered data frame?" 
+        "\nEnter(y/n): "
+    ).strip().lower()    
+    if (preview_choice == "y"):
+        print(f"\ndf_MAIN_DATA: {df_MAIN_DATA.shape}") 
+        print(df_MAIN_DATA.head(20))
+    else: 
+        print("\nContinuing foward.")
+
+
+    manual_visual_check = input(
+        "\nVisual Check: Render a molecule? "
+        "\nEnter (y/n): "
+    )
+    if (manual_visual_check == "y"):
+        confirmation = input(
+            "\nThis takes a very long time to complete rendering." 
+            "\nAre you sure you would like to render rn?"
+            "\nEnter (y/n): ")
+        if (confirmation == "y"):
+            visual_check_render(df_MAIN_DATA)
+        else:
+            print("Proceedign forward.")
+    else:
+        print("Proceedign forward.")
+
+
+    export_MAIN_DATA_choice = input(
+        "\nProceed to export merged data frame input?"
+        "\nEnter (y/n): "
+    )
+    if export_MAIN_DATA_choice == "y":
+        df_MAIN_DATA.to_csv(r"C:\NCI-60 Research\Tokenization\Output_Files\df_MAIN_DATA.csv", index=False)
+        print("df_MAIN_DATA saved.")
+    else:
+        print("Proceeding forward.")
+
+
+    proceeding_choice = input(
+            "\nProceed to tokenization of SMILES string?"
+            "\nEnter (y/n): "
+    )
+    if proceeding_choice == "y":
+        get_and_save_functional_group_data_execution_script (df_MAIN_DATA)
+    else:
+        print("End of script.")
+    return
+
+
+
+def get_and_save_functional_group_data_execution_script (df_MAIN_DATA):
+
+    unique_smiles_list = df_MAIN_DATA["SMILES"].unique().tolist()
+    print(
+        f"\nFound {len(unique_smiles_list)} unique molecules."
+        "\nProceeding to locate functional groups and fragments."
+    ) 
+
+    import_previous_functional_group_outputs_choice = input(
+        "\nImport previously saved [get_functional_group_data] output files?"
+        "\nEnter 'y' for prototype/testing, otherwise enter 'n'"
+        "\nEnter (y/n): "
+    )
+    #TODO: ended up not needing if/else conditional statement here
+    if import_previous_functional_group_outputs_choice == "y":
+        print("\nLoading functional groups in df_MAIN_DATA.")
+        get_and_save_functional_group_data (df_MAIN_DATA, import_previous_functional_group_outputs_choice)
+        
+    elif import_previous_functional_group_outputs_choice == "n":
+        print("\nLocating functional groups in df_MAIN_DATA.")
+        get_and_save_functional_group_data (df_MAIN_DATA, import_previous_functional_group_outputs_choice)
+        
+    return
+
+import_previous_outputs()
+
+
+
+
